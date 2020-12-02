@@ -2305,6 +2305,147 @@ class TestLinalg(TestCase):
             self.assertEqual(torch.matrix_rank(aaT, True), np.linalg.matrix_rank(aaT.cpu().numpy(), True))
             self.assertEqual(torch.matrix_rank(aaT, 0.01, True), np.linalg.matrix_rank(aaT.cpu().numpy(), 0.01, True))
 
+    def test_einsum(self, device):
+        def check(equation, *operands):
+            ref = np.einsum(equation, *[operand.cpu().numpy() for operand in operands])
+            res = torch.einsum(equation, operands)
+            self.assertEqual(res.cpu(), torch.from_numpy(np.array(ref)))
+
+            # Autograd check (FIXME: tests below fail check)
+            if equation not in {"i,i->", "i,i->i", "ij,ij->ij"}:
+                ops = [op.detach().requires_grad_() for op in operands]
+                self.assertTrue(torch.autograd.gradcheck(lambda *ops: torch.einsum(equation, ops), ops))
+                for op in ops:
+                    self.assertTrue(op._version == 0)
+
+        # Test cases from https://gist.github.com/rockt/15ee013889d65342088e9260a377dc8f
+        x = torch.rand(5, device=device)
+        y = torch.rand(7, device=device)
+        A = torch.randn(3, 5, device=device)
+        B = torch.randn(2, 5, device=device)
+        C = torch.randn(2, 3, 5, device=device)
+        D = torch.randn(2, 5, 7, device=device)
+        E = torch.randn(7, 9, device=device)
+        F = torch.randn(2, 3, 3, 5, device=device)
+        G = torch.randn(5, 4, 6, device=device)
+        H = torch.randn(4, 4, device=device)
+        I = torch.rand(2, 3, 2, device=device)
+
+        # Vector operations
+        check('i->', x)                     # sum
+        check('i,i->', x, x)                # dot
+        check('i,i->i', x, x)               # vector element-wisem mul
+        check('i,j->ij', x, y)              # outer
+
+        # Matrix operations
+        check("ij->ji", A)                  # transpose
+        check("ij->j", A)                   # row sum
+        check("ij->i", A)                   # col sum
+        check("ij,ij->ij", A, A)            # matrix element-wise mul
+        check("ij,j->i", A, x)              # matrix vector multiplication
+        check("ij,kj->ik", A, B)            # matmul
+        check("ij,ab->ijab", A, E)          # matrix outer product
+
+        # Tensor operations
+        check("aij,ajk->aik", C, D)         # batch matmul
+        check("ijk,jk->i", C, A)            # tensor matrix contraction
+        check("aij,jk->aik", D, E)          # tensor matrix contraction
+        check("abcd,dfg->abcfg", F, G)      # tensor tensor contraction
+        check("ijk,jk->ik", C, A)           # tensor matrix contraction with double indices
+        check("ijk,jk->ij", C, A)           # tensor matrix contraction with double indices
+        check("ijk,ik->j", C, B)            # non contiguous
+        check("ijk,ik->jk", C, B)           # non contiguous with double indices
+
+        # Test diagonals
+        check("ii", H)                      # trace
+        check("ii->i", H)                   # diagonal
+        check('iji->j', I)                  # non-contiguous trace
+
+        # Test ellipsis
+        check("i...->...", H)
+        check("ki,...k->i...", A.t(), B)
+        check("k...,jk->...", A.t(), B)
+        check('...ik, ...kj -> ...ij', torch.rand(2, 3, 4), torch.rand(1, 5))
+        check('bik,k...j->i...j', torch.rand(5, 2, 3), torch.rand(3, 2))
+        check('i...j, ij... -> ...ij', torch.rand(2, 3, 4), torch.rand(2, 4, 2, 3))
+
+        # torch.bilinear with discontiguous tensors
+        l = torch.randn(10, 5, device=device).transpose(0, 1)
+        r = torch.randn(20, 5, device=device).transpose(0, 1)
+        w = torch.randn(15, 10, 20, device=device)
+        check("bn,anm,bm->ba", l, w, r)
+        # with strided tensors
+        check("bn,anm,bm->ba", l[:, ::2], w[:, ::2, ::2], r[:, ::2])
+
+    def test_einsum_corner_cases(self, device):
+        def check(equation, *operands, expected_output):
+            tensors = [torch.tensor(operand, dtype=torch.float32, device=device) if not isinstance(operand, tuple)
+                       else torch.rand(operand, dtype=torch.float32, device=device) for operand in operands]
+            output = torch.einsum(equation, tensors)
+            self.assertEqual(output, torch.tensor(expected_output, dtype=torch.float32, device=device))
+
+        # Test equation variantions
+        check(' ', 1, expected_output=1)
+        check(' -> ', 1, expected_output=1)
+        check(' , ', 2, 2, expected_output=4)
+        check(' , , ', 2, 2, 2, expected_output=8)
+        check(' , -> ', 2, 2, expected_output=4)
+        check(' i ', [1], expected_output=[1])
+        check(' i -> ', [1], expected_output=1)
+        check(' i -> i ', [1], expected_output=[1])
+        check(' i , i ', [2], [2], expected_output=4)
+        check(' i , i -> i ', [2], [2], expected_output=[4])
+
+        # Test tensors with 0 size dimensions
+        check('i', [], expected_output=[])
+        check(' i j -> j', [[], []], expected_output=[])
+        check('ij->i', [[], []], expected_output=[0., 0.])
+        check(' i j k  ,  k  -> i j ', (3, 0, 6), (6,), expected_output=[[], [], []])
+
+        # Test broadcasting
+        check('i,j', [2], [1, 2], expected_output=[[2, 4]])
+        check('i,ij->ij', [1, 2], [[1, 2, 3], [2, 3, 4]], expected_output=[[1, 2, 3], [4, 6, 8]])
+
+        # Test ellipsis broadcasting
+        check('...', 1, expected_output=1)
+        check('...->', 1, expected_output=1)
+        check('...->...', 1, expected_output=1)
+        check('...', [1], expected_output=[1])
+        check('...->', [1], expected_output=1)
+        check('i...->i', [1], expected_output=[1])
+        check('i...->...i', [1], expected_output=[1])
+        check('...a->', [[2], [4]], expected_output=6)
+        check('a...b->ab', [[[1], [2]], [[3], [4]]], expected_output=[[3], [7]])
+
+    def test_einsum_error_cases(self, device):
+        def check(equation, operands, regex, exception=RuntimeError):
+            with self.assertRaisesRegex(exception, r'einsum\(\) ' + regex):
+                torch.einsum(equation, operands)
+
+        x = torch.rand(2)
+        y = torch.rand(2, 3)
+
+        check('', [], r'must provide at least one operand')
+        check('. ..', [x], r'found \'.\' for operand 0 that is not part of any ellipsis')
+        check('... ...', [x], r'found \'.\' for operand 0 for which an ellipsis was already found')
+        check('A', [x], r'operand subscript must be in range \[a, z\] but found A for operand 0')
+        check(',', [x], r'fewer operands were provided than specified in the equation')
+        check('', [x, x], r'more operands were provided than specified in the equation')
+        check('', [x], r'the number of subscripts in the equation \(0\) does not match the number '
+                       r'of dimensions \(1\) for operand 0 and no ellipsis was given')
+        check('ai', [x], r'the number of subscripts in the equation \(2\) does not match the number '
+                         r'of dimensions \(1\) for operand 0 and no ellipsis was given')
+        check('ai...', [x], r'the number of subscripts in the equation \(2\) is more than the number '
+                            r'of dimensions \(1\) for operand 0')
+        check('a->... .', [x], r'found \'.\' for output but an ellipsis \(...\) was already found')
+        check('a->..', [x], r'found \'.\' for output that is not part of any ellipsis \(...\)')
+        check('a->A', [x], r'subscripts must be in range \[a, z\] but found A for the output')
+        check('a->aa', [x], r'output subscript a appears more than once in the output')
+        check('a->i', [x], r'output subscript i does not appear in the equation for any input operand')
+        check('aa', [y], r'subscript a is repeated for operand 0 but the sizes don\'t match, 3 != 2')
+        check('a, ba', [x, y], r'operands do not broadcast with remapped shapes \[original->remapped\]: '
+                               r'\[2\]->\[1, 2\] \[2, 3\]->\[2, 3\]')
+
     def triangular_solve_test_helper(self, A_dims, b_dims, upper, unitriangular,
                                      device, dtype):
         triangle_function = torch.triu if upper else torch.tril
@@ -2956,80 +3097,6 @@ class TestLinalg(TestCase):
 
         if self.device_type == 'cuda':
             run_test(False)
-
-    @onlyCPU
-    @slowTest
-    @dtypes(torch.double)
-    def test_einsum(self, device: torch.device, dtype: torch.dtype) -> None:
-        # test cases taken from https://gist.github.com/rockt/15ee013889d65342088e9260a377dc8f
-        x = torch.randn(5, dtype=dtype, device=device)
-        y = torch.randn(7, dtype=dtype, device=device)
-        A = torch.randn(3, 5, dtype=dtype, device=device)
-        B = torch.randn(2, 5, dtype=dtype, device=device)
-        C = torch.randn(2, 3, 5, dtype=dtype, device=device)
-        D = torch.randn(2, 5, 7, dtype=dtype, device=device)
-        E = torch.randn(7, 9, dtype=dtype, device=device)
-        F = torch.randn(2, 3, 5, 7, dtype=dtype, device=device)
-        G = torch.randn(7, 11, 13, dtype=dtype, device=device)
-        H = torch.randn(4, 4, dtype=dtype, device=device)
-        I = torch.randn(3, 4, 4, dtype=dtype, device=device)
-        l = torch.randn(5, 10, dtype=dtype, device=device)
-        r = torch.randn(5, 20, dtype=dtype, device=device)
-        w = torch.randn(30, 10, 20, dtype=dtype, device=device)
-        test_list: List[Union[Tuple[str, torch.Tensor],
-                        Tuple[str, torch.Tensor, torch.Tensor],
-                        Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor]]] = [
-            # -- Vector
-            ("i->", x),                 # sum
-            ("i,i->", x, x),            # dot
-            ("i,i->i", x, x),           # vector element-wise mul
-            ("i,j->ij", x, y),          # outer
-            # -- Matrix
-            ("ij->ji", A),              # transpose
-            ("ij->j", A),               # row sum
-            ("ij->i", A),               # col sum
-            ("ij,ij->ij", A, A),        # matrix element-wise mul
-            ("ij,j->i", A, x),          # matrix vector multiplication
-            ("ij,kj->ik", A, B),        # matmul
-            ("ij,ab->ijab", A, E),      # matrix outer product
-            # -- Tensor
-            ("aij,ajk->aik", C, D),     # batch matmul
-            ("ijk,jk->i", C, A),        # tensor matrix contraction
-            ("aij,jk->aik", D, E),      # tensor matrix contraction
-            ("abcd,dfg->abcfg", F, G),  # tensor tensor contraction
-            ("ijk,jk->ik", C, A),       # tensor matrix contraction with double indices
-            ("ijk,jk->ij", C, A),       # tensor matrix contraction with double indices
-            ("ijk,ik->j", C, B),        # non contiguous
-            ("ijk,ik->jk", C, B),       # non contiguous with double indices
-            # -- Diagonal
-            ("ii", H),                 # trace
-            ("ii->i", H),              # diagonal
-            # -- Ellipsis
-            ("i...->...", H),
-            ("ki,...k->i...", A.t(), B),
-            ("k...,jk", A.t(), B),
-            ("...ii->...i", I),       # batch diagonal
-            # -- Other
-            ("bn,anm,bm->ba", l, w, r),  # as torch.bilinear
-            ("... ii->...i  ", I),       # batch diagonal with spaces
-        ]
-        for test in test_list:
-            actual = torch.einsum(test[0], test[1:])
-            expected = np.einsum(test[0], *[t.numpy() for t in test[1:]])
-            self.assertEqual(expected.shape, actual.shape, msg=test[0])
-            self.assertEqual(expected, actual, msg=test[0])
-            # test vararg
-            actual2 = torch.einsum(test[0], *test[1:])
-            self.assertEqual(expected.shape, actual2.shape, msg=test[0])
-            self.assertEqual(expected, actual2, msg=test[0])
-
-            def do_einsum(*args):
-                return torch.einsum(test[0], args)
-            # FIXME: following test cases fail gradcheck
-            if test[0] not in {"i,i->", "i,i->i", "ij,ij->ij"}:
-                gradcheck_inps = tuple(t.detach().requires_grad_() for t in test[1:])
-                self.assertTrue(torch.autograd.gradcheck(do_einsum, gradcheck_inps))
-            self.assertTrue(A._version == 0)  # check that we do not use inplace ops
 
     @skipCUDAIfNoMagma
     @skipCPUIfNoLapack
