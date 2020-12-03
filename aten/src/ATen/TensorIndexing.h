@@ -4,6 +4,7 @@
 #include <ATen/core/TensorBody.h>
 #include <ATen/ExpandUtils.h>
 #include <ATen/Functions.h>
+#include <ATen/ScalarOps.h>
 
 // TODO: try to remove this
 // There is some back story, see https://github.com/pytorch/pytorch/issues/48684
@@ -249,8 +250,8 @@ static inline Tensor boolToIndexingTensor(const Tensor& self, bool value, const 
   }
 }
 
-static inline Tensor scalarToTensorCPUOrCUDA(Scalar v, const TensorOptions& options) {
-  return at::native::scalar_tensor(v, options);
+static inline Tensor scalarToTensorCPU(Scalar v, const TensorOptions& options) {
+  return at::detail::scalar_tensor_static(v, v.type(), options.device_opt());
 }
 
 static inline Tensor scalarToTensorNonNativeDeviceType(Scalar v, const TensorOptions& options) {
@@ -320,8 +321,8 @@ static inline int64_t count_specified_dimensions(const ArrayRef<TensorIndex>& in
 // The rest of the functions are in `at::indexing::impl` namespace, signifying
 // that they shouldn't be used from Python indexing implementation.
 static inline Tensor scalarToTensor(Scalar v, const TensorOptions& options, const at::Device& self_device) {
-  if (self_device == at::kCPU || self_device == at::kCUDA) {
-    return impl::scalarToTensorCPUOrCUDA(v, options);
+  if (self_device == at::kCPU) {
+    return impl::scalarToTensorCPU(v, options);
   } else {
     return impl::scalarToTensorNonNativeDeviceType(v, options);
   }
